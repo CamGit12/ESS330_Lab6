@@ -1,0 +1,13 @@
+---
+title: "index"
+format: html
+editor: visual
+format:
+  html:
+    self-contained: true
+execute:
+  echo: true
+
+project:
+  output-dir: docs
+---
