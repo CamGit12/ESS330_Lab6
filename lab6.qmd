@@ -1,10 +1,9 @@
 ---
 title: "index"
-format: html
-editor: visual
-format:
+format: 
   html:
     self-contained: true
+editor: visual
 execute:
   echo: true
 project:
@@ -308,11 +307,13 @@ autoplot(wf)
 rank_results(wf, rank_metric = "rsq", select_best = TRUE)
 
 ```
-The model that performed the best was the neural network model ("bag_mlp") by workflow ID. It was the best model because it had the lowest RMSE of 0.531, with the next lowest RMSE being 0.561 (random forest model). Additionally, it had the best r-squared of 0.797, which means this model explained the most variabiity in the data out of the models tested. Ultimately, for these reasons I would choose the neural net as my favored model to move forward with. 
+
+The model that performed the best was the neural network model ("bag_mlp") by workflow ID. It was the best model because it had the lowest RMSE of 0.531, with the next lowest RMSE being 0.561 (random forest model). Additionally, it had the best r-squared of 0.797, which means this model explained the most variabiity in the data out of the models tested. Ultimately, for these reasons I would choose the neural net as my favored model to move forward with.
 
 ## Build my own ML Pipeline to predict mean streamflow from CAMELS dataset
 
 #### Datasplit
+
 ```{r}
 #Set a seed for reproducible
 set.seed(123)
@@ -325,8 +326,6 @@ camels_test <- testing(camels_split)
 #Build a 10-fold CV dataset as well
 camels_cv <- vfold_cv(camels_train, v = 10)
 ```
-
-
 
 #### Recipe
 
@@ -349,8 +348,7 @@ rec_new <-  recipe(logQmean ~ slope_mean + area_gages2, data = camels_train) %>%
   step_naomit(all_predictors(), all_outcomes())
 ```
 
-I am choosing this formula because each of these predictor variables should strongly impact the mean discharge.I chose catchment slope because increased steep slopes will result in more runoff and therefore discharge levels. Finally, catchment area will impact discharge by a positive correlation, with more precipitation being caught in a catchment one can expect more runoff to make it to turn into discharge in rivers. 
-
+I am choosing this formula because each of these predictor variables should strongly impact the mean discharge.I chose catchment slope because increased steep slopes will result in more runoff and therefore discharge levels. Finally, catchment area will impact discharge by a positive correlation, with more precipitation being caught in a catchment one can expect more runoff to make it to turn into discharge in rivers.
 
 #### Define 3 models
 
@@ -372,7 +370,6 @@ boosted_model <- boost_tree() %>%
 
 ```
 
-
 #### Workflowset
 
 ```{r}
@@ -380,8 +377,6 @@ wf_new <- workflow_set(list(rec_new),
                        list(linear_model, rand_forest_model, boosted_model)) %>% 
   workflow_map('fit_resamples', resamples = camels_cv)
 ```
-
-
 
 #### Evaluation
 
@@ -397,8 +392,8 @@ best_model_id <- newmodel_ranks$wflow_id[1]
 print(best_model_id)
 
 ```
-My linear regression model was my best result, as it had the best r squared value of all of the models, but it performed poorly. My r squared was 0.19, which indicates that a very samll amount of variation was explained using this linear model and my predictor variables.
 
+My linear regression model was my best result, as it had the best r squared value of all of the models, but it performed poorly. My r squared was 0.19, which indicates that a very samll amount of variation was explained using this linear model and my predictor variables.
 
 #### Extract and Evaluate
 
@@ -432,4 +427,4 @@ final_metrics <- final_workflow %>%
 print(final_metrics)
 ```
 
-My results are still poor. My r squared is 0.156, which is far lower than the target .9 r squared value. These results indicate to me that there is far stronger predictor variables for logQmean  (discharge) than slope and catchment area. This is understandable to me, but I had expected stronger results than this. With further time, I would return to my predictor variables and models to further my work predicting discharge with this dataset and the models I can create. 
+My results are still poor. My r squared is 0.156, which is far lower than the target .9 r squared value. These results indicate to me that there is far stronger predictor variables for logQmean (discharge) than slope and catchment area. This is understandable to me, but I had expected stronger results than this. With further time, I would return to my predictor variables and models to further my work predicting discharge with this dataset and the models I can create.
