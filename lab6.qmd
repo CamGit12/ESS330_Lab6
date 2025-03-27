@@ -1,0 +1,435 @@
+---
+title: "index"
+format: html
+editor: visual
+format:
+  html:
+    self-contained: true
+execute:
+  echo: true
+project:
+  output-dir: docs
+---
+
+## Preparation
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+library(ggplot2)
+library(patchwork)
+library(xgboost)
+```
+
+```{r}
+#root
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+#documentation pdf
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+```
+
+## Question 1
+
+```{r}
+#get basin characteristics
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+# Where the files live online ...
+remote_files  <- glue('{root}/camels_{types}.txt')
+# where we want to download the data ...
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+#read/merge data
+# Read and merge data
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+
+#join all the dataframes (n=6)
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+The "zero_q_freq" represents the number of occurrences of days with zero flow (Q = 0mm/day).
+
+## Question 2
+
+```{r}
+#map sites (given)
+ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = q_mean)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map()
+
+#my map 1
+aridity_map <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = aridity)) +
+  scale_color_gradient(low = "brown", high = "blue") +
+  labs(color = "Priestley-Taylor Aridity Index", 
+       x = "Longitude",
+       y = "Latitude")
+  ggthemes::theme_map()
+
+#my map 2
+pmean_map <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = p_mean)) +
+  scale_color_gradient(low = "grey", high = "darkblue") +
+  labs(color = "Mean Precipitation (mm/day", 
+       x = "Longitude",
+       y = "Latitude") +
+  ggthemes::theme_map()
+
+print(aridity_map)
+print(pmean_map)
+
+bothmaps <- (aridity_map | pmean_map)
+
+bothmaps <- bothmaps +
+  labs(title = "Combined Map of Aridity and Precipitation - US")
+  
+print(bothmaps)
+
+file_path <- "C:/Users/laxca/Softwares/Git/ESS330_Lab6/img/bothmaps.png"
+ggsave(filename = file_path, plot = bothmaps, width = 20, height = 5, dpi = 600)
+```
+
+## Question 3
+
+#### Model prep/EDA
+
+```{r}
+#initial analyses
+camels |> 
+  select(aridity, p_mean, q_mean) |> 
+  drop_na() |> 
+  cor()
+
+#Visual EDA
+# Create a scatter plot of aridity vs rainfall
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  # Add points colored by mean flow
+  geom_point(aes(color = q_mean)) +
+  # Add a linear regression line
+  geom_smooth(method = "lm", color = "red", linetype = 2) +
+  # Apply the viridis color scale
+  scale_color_viridis_c() +
+  # Add a title, axis labels, and theme (w/ legend on the bottom)
+  theme_linedraw() + 
+  theme(legend.position = "bottom") + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow")
+
+#log transform
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  scale_color_viridis_c() +
+  # Apply log transformations to the x and y axes
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom") + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow")
+
+#visualize q_mean
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  # Apply a log transformation to the color scale
+  scale_color_viridis_c(trans = "log") +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom",
+        # Expand the legend width ...
+        legend.key.width = unit(2.5, "cm"),
+        legend.key.height = unit(.5, "cm")) + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow") 
+```
+
+#### Model Building
+
+```{r}
+set.seed(123)
+# Bad form to perform simple transformations on the outcome variable within a 
+# recipe. So, we'll do it here.
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+# Generate the split
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+camels_cv <- vfold_cv(camels_train, v = 10)
+
+# Create a recipe to preprocess the data
+rec <-  recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
+  # Log transform the predictor variables (aridity and p_mean)
+  step_log(all_predictors()) %>%
+  # Add an interaction term between aridity and p_mean
+  step_interact(terms = ~ aridity:p_mean) |> 
+  # Drop any rows with missing values in the pred
+  step_naomit(all_predictors(), all_outcomes())
+
+# Prepare the data
+baked_data <- prep(rec, camels_train) |> 
+  bake(new_data = NULL)
+
+# Interaction with lm
+#  Base lm sets interaction terms with the * symbol
+lm_base <- lm(logQmean ~ aridity * p_mean, data = baked_data)
+summary(lm_base)
+
+# Sanity Interaction term from recipe ... these should be equal!!
+summary(lm(logQmean ~ aridity + p_mean + aridity_x_p_mean, data = baked_data))
+
+#2 wrong versions, 1 right
+
+#correct: prep then bake then predict
+test_data <-  bake(prep(rec), new_data = camels_test)
+test_data$lm_pred <- predict(lm_base, newdata = test_data)
+
+#evaluate
+metrics(test_data, truth = logQmean, estimate = lm_pred)
+
+ggplot(test_data, aes(x = logQmean, y = lm_pred, colour = aridity)) +
+  # Apply a gradient color scale
+  scale_color_gradient2(low = "brown", mid = "orange", high = "darkgreen") +
+  geom_point() +
+  geom_abline(linetype = 2) +
+  theme_linedraw() + 
+  labs(title = "Linear Model: Observed vs Predicted",
+       x = "Observed Log Mean Flow",
+       y = "Predicted Log Mean Flow",
+       color = "Aridity")
+
+#Use workflow
+# Define model
+lm_model <- linear_reg() %>%
+  # define the engine
+  set_engine("lm") %>%
+  # define the mode
+  set_mode("regression")
+
+# Instantiate a workflow ...
+lm_wf <- workflow() %>%
+  # Add the recipe
+  add_recipe(rec) %>%
+  # Add the model
+  add_model(lm_model) %>%
+  # Fit the model to the training data
+  fit(data = camels_train) 
+
+# Extract the model coefficients from the workflow
+summary(extract_fit_engine(lm_wf))$coefficients
+
+# From the base implementation
+summary(lm_base)$coefficients
+
+#use augment with new data to make predictions on dartaset
+lm_data <- augment(lm_wf, new_data = camels_test)
+dim(lm_data)
+
+metrics(lm_data, truth = logQmean, estimate = .pred)
+
+ggplot(lm_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+
+#switch it up
+library(baguette)
+rf_model <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_wf <- workflow() %>%
+  # Add the recipe
+  add_recipe(rec) %>%
+  # Add the model
+  add_model(rf_model) %>%
+  # Fit the model
+  fit(data = camels_train) 
+
+#predictions
+rf_data <- augment(rf_wf, new_data = camels_test)
+dim(rf_data)
+
+#model evaluation
+metrics(rf_data, truth = logQmean, estimate = .pred)
+ggplot(rf_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+
+#workflow set approach
+wf <- workflow_set(list(rec), list(lm_model, rf_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+
+autoplot(wf)
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+
+```
+
+## Question 3: My Turn
+
+```{r}
+#build xgboost (engine) regression (mode) model using boost_tree
+xgboost_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+#build neural network model using the nnet engine from the baguette package using the bag_mlp function
+nn_model <- bag_mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+#Add this to the above workflow
+wf <- workflow_set(list(rec), list(lm_model, rf_model, xgboost_model, nn_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv)
+#Evaluate the model and compare it to the linear and random forest models
+autoplot(wf)
+#Which of the 4 models would you move forward with?
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+
+```
+The model that performed the best was the neural network model ("bag_mlp") by workflow ID. It was the best model because it had the lowest RMSE of 0.531, with the next lowest RMSE being 0.561 (random forest model). Additionally, it had the best r-squared of 0.797, which means this model explained the most variabiity in the data out of the models tested. Ultimately, for these reasons I would choose the neural net as my favored model to move forward with. 
+
+## Build my own ML Pipeline to predict mean streamflow from CAMELS dataset
+
+#### Datasplit
+```{r}
+#Set a seed for reproducible
+set.seed(123)
+#Create an initial split with 75% used for training and 25% for testing
+camels_split <- initial_split(camels, prop = 0.75)
+#Extract your training and testing sets
+camels_train <- training(camels_split)
+camels_test <- testing(camels_split)
+
+#Build a 10-fold CV dataset as well
+camels_cv <- vfold_cv(camels_train, v = 10)
+```
+
+
+
+#### Recipe
+
+```{r}
+#predictor variables: forest_frac, slope_mean, area_gages2, dom_land_cover
+
+#define formula
+logQmean ~ slope_mean + area_gages2
+
+#Describe in words why you are choosing the formula you are
+
+#Build a recipe that you feel handles the predictors chosen well
+
+rec_new <-  recipe(logQmean ~ slope_mean + area_gages2, data = camels_train) %>%
+  # Log transform the predictor variables
+  step_log(all_predictors()) %>%
+  # Add an interaction term between aridity and p_mean
+  step_interact(terms = ~ slope_mean:area_gages2) |> 
+  # Drop any rows with missing values in the pred
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+I am choosing this formula because each of these predictor variables should strongly impact the mean discharge.I chose catchment slope because increased steep slopes will result in more runoff and therefore discharge levels. Finally, catchment area will impact discharge by a positive correlation, with more precipitation being caught in a catchment one can expect more runoff to make it to turn into discharge in rivers. 
+
+
+#### Define 3 models
+
+```{r}
+#LM
+linear_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+#Random Forest
+rand_forest_model <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+# XGBoost Model
+boosted_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+```
+
+
+#### Workflowset
+
+```{r}
+wf_new <- workflow_set(list(rec_new),
+                       list(linear_model, rand_forest_model, boosted_model)) %>% 
+  workflow_map('fit_resamples', resamples = camels_cv)
+```
+
+
+
+#### Evaluation
+
+```{r}
+autoplot(wf_new)
+
+#rank results
+newmodel_ranks <- rank_results(wf_new, rank_metric = "rsq", select_best = TRUE)
+
+print(newmodel_ranks)
+#best
+best_model_id <- newmodel_ranks$wflow_id[1]
+print(best_model_id)
+
+```
+My linear regression model was my best result, as it had the best r squared value of all of the models, but it performed poorly. My r squared was 0.19, which indicates that a very samll amount of variation was explained using this linear model and my predictor variables.
+
+
+#### Extract and Evaluate
+
+```{r}
+#final workflow
+final_workflow <- wf_new %>%
+  extract_workflow(id = best_model_id) %>% last_fit(split = camels_split)
+
+#predictions
+predictions <- final_workflow %>% 
+  collect_predictions()
+
+#predicted vs actual
+ggplot(predictions, aes(x = logQmean, y = .pred)) +
+  geom_point(aes(color = stat(x)), alpha = 0.6) +
+  scale_color_gradient(low = "blue", high = "red") +
+  geom_abline(color = "green", linetype = 2) +
+  labs(
+    title = "Predicted vs Actual Log Mean Streamflow",
+    subtitle = paste("Best Model:", best_model_id),
+    x = "Actual Log Mean Streamflow",
+    y = "Predicted Log Mean Streamflow",
+    color = "Actual Value"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+final_metrics <- final_workflow %>%
+  collect_metrics()
+
+print(final_metrics)
+```
+
+My results are still poor. My r squared is 0.156, which is far lower than the target .9 r squared value. These results indicate to me that there is far stronger predictor variables for logQmean  (discharge) than slope and catchment area. This is understandable to me, but I had expected stronger results than this. With further time, I would return to my predictor variables and models to further my work predicting discharge with this dataset and the models I can create. 
