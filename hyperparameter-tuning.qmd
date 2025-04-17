@@ -1,0 +1,313 @@
+---
+title: "hyperparameter-tuning"
+format: 
+  html:
+    self-contained: true
+editor: visual
+execute:
+  echo: true
+project:
+  output-dir: docs
+---
+# Lab 8 - HyperParameter Tuning
+
+
+## Data import/tidy/transform
+
+```{r}
+#libraries
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+library(ggplot2)
+library(patchwork)
+library(xgboost)
+library(skimr)
+library(visdat)
+
+#data ingest
+#root
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+#documentation pdf
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+#get basin characteristics
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+# Where the files live online ...
+remote_files  <- glue('{root}/camels_{types}.txt')
+# where we want to download the data ...
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+#read/merge data
+# Read and merge data
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+
+#join all the dataframes (n=6)
+camels_raw <- power_full_join(camels ,by = 'gauge_id')
+
+#data cleaning
+camels <- camels_raw %>% 
+  mutate(
+    elev_mean = as.numeric(elev_mean),
+    slope_mean = as.numeric(slope_mean))
+
+skim_summary <- skim(camels)
+print(skim_summary)
+
+vis_missingdata <- vis_miss(camels)
+
+```
+
+
+## Data splitting
+
+```{r}
+#start
+set.seed(123)
+
+#log transform Qmean
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+# test/training split
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+#feature engineering
+
+#q_mean vs. aridity
+ggplot(camels_train, aes(x = aridity, y = q_mean)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red")
+#q_mean vs. elev_mean
+ggplot(camels_train, aes(x = elev_mean, y = q_mean)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red")
+
+# Create recipe 
+rec <-  recipe(logQmean ~ aridity + elev_mean, data = camels_train) %>%
+  step_log(all_predictors()) %>%
+  step_interact(terms = ~ aridity:elev_mean) |> 
+  step_naomit(all_predictors(), all_outcomes())
+
+# Prep data
+baked_data <- prep(rec, camels_train) |> 
+  bake(new_data = NULL)
+
+```
+
+
+## Data Resampling and Model Testing
+
+```{r}
+#cross validation Dataset (k-folds)
+folds <- vfold_cv(camels_train, v = 10)
+
+#Define 3 regression models
+
+#1- Linear Model
+lm_model <- linear_reg() %>%
+  # define the engine
+  set_engine("lm") %>%
+  # define the mode
+  set_mode("regression")
+
+#2- Linear ModelRand Forest
+RF_model <- rand_forest() %>%
+  # define the engine
+  set_engine("ranger") %>%
+  # define the mode
+  set_mode("regression")
+
+#3- Boosted Tree
+xgb_model <- boost_tree() %>%
+  # define the engine
+  set_engine("xgboost") %>%
+  # define the mode
+  set_mode("regression")
+
+#Workflow Setup/Map/Autoplot
+#models
+# Create workflows for each model
+lm_workflow <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lm_model)
+
+rf_workflow <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(RF_model)
+
+xgb_workflow <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(xgb_model)
+
+# Combine workflows into a workflow set
+base_workflows <- workflow_set(
+  preproc = list(simple = rec),
+   models = list(
+    linear_reg = lm_model,
+    random_forest = RF_model,
+    xgboost = xgb_model
+  )
+)
+
+# Test the models using workflow_map()
+model_metrics <- base_workflows %>%
+  workflow_map(
+    resamples = folds,
+    metrics = metric_set(rmse, rsq, mae))
+
+#results
+autoplot(model_metrics)
+
+#Model Selection and Justification
+```
+#### Model Selection and Justification
+I am going to choose the random forest model, as it performs the best in the R-squared metric, which is most important to me as I am looking to find a model that best explains the variability in my discharge. Due to this metric, the random forest model will allow me the best predictive power and that is what I am shooting for. 
+
+My random forest model used the ranger engine and regression mode. The reason I beleive this model performed the best was that it works well on non linear relationships, which was likely due to aridity and elevation not being directly and perfectly linked in the real world. 
+
+## Model Tuning
+
+```{r}
+#tunable model setup
+# Tunable Random Forest model specification
+rf_tune_model <- rand_forest(
+  mtry = tune(),
+  min_n = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+#Tunable Workflow defined
+rf_tune_workflow <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_tune_model)
+
+dials <- extract_parameter_set_dials(rf_tune_workflow)
+
+dials$object
+
+dials <- extract_parameter_set_dials(rf_tune_workflow)
+
+dials <- dials %>% 
+  finalize(select(camels_train, aridity, elev_mean))
+
+
+#defined search space
+my.grid <- grid_latin_hypercube(dials, size = 20)
+
+#Executed tune grid
+model_params <- tune_grid(
+  rf_tune_workflow,
+  resamples = folds,
+  grid = my.grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE))
+
+autoplot(model_params)
+
+```
+
+#### Dial ranges
+I am tuning "mtry" to limit the model complexity through limts on the number of predictors implemented at each split of my rf model. I am also fitting the "min_n" which allows me to minimize the number of observations at each node. Ultimately both of these hyperparameters can limit the risk of overfitting with my model.
+
+## Check the skill of tuned model
+
+```{r}
+#collect_metrics, Showbest, describe in plain language the interpretation of these
+
+collect_metrics(model_params) %>%
+  arrange(.metric == "mae")
+
+show_best(model_params, metric = "mae")
+hp_best <- select_best(model_params, metric = "mae")
+
+```
+
+
+## Finalize model
+
+```{r}
+#Finalize workflow
+final_rf_workflow <- finalize_workflow(rf_tune_workflow, hp_best)
+
+```
+
+
+## Final model verification
+
+```{r}
+# Implement the last fit
+final_fit <- last_fit(final_rf_workflow, split = camels_split)
+
+#Interpret metrics
+collect_metrics(final_fit)
+
+#plot predictions
+final_fit %>%
+  collect_predictions() %>%
+  ggplot(aes(x = .pred, y = logQmean)) +
+  geom_point(aes(color = logQmean), alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue", linetype = "dashed") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dotted") +
+  scale_color_viridis_c() +
+  labs(title = "Predicted vs Observed log(Qmean)",
+       x = "Predicted log(Qmean)", y = "Observed log(Qmean)") +
+  theme_minimal()
+
+```
+
+
+## Final Figure
+
+```{r}
+#Augment Data and Calculate residuals
+final_model_full <- fit(final_rf_workflow, data = camels_test)
+camels_predicted <- augment(final_model_full, new_data = camels_test) %>%
+  mutate(residual = (logQmean - .pred)^2)
+
+#Map Predicted Q and Residuals
+library(patchwork)
+
+pred_map <- ggplot(camels_predicted, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point(size = 2) +
+  scale_color_viridis_c(option = "C") +
+  coord_fixed(1.3) +
+  labs(title = "Predicted log(Qmean)", color = "Prediction") +
+  theme_minimal()
+
+resid_map <- ggplot(camels_predicted, aes(x = gauge_lon, y = gauge_lat, color = residual)) +
+  geom_point(size = 2) +
+  scale_color_viridis_c(option = "A") +
+  coord_fixed(1.3) +
+  labs(title = "Prediction Residuals (squared)", color = "Residual") +
+  theme_minimal()
+
+pred_map + resid_map
+
+
+```
+
+## Results/Discussion
+1.) The Random Forest model was selected as the best performing model due to its lowest RMSE of 1.63 and highest R-squared of 0.949. These metrics indicate that this model had the smallest prediction error and explains the largest portion of the variance in the q_mean variable compared to the other models I assessed.
+
+2.) Tunable hyperparameters for my random Forest model:
+mtry: Ranges from 2 to 18.
+min_n: Ranges from 2 to 20.
+
+These ranges represent the search space during my hyperparameter tuning that helped me optimize my model performance.
+
+3.) The final tuned model achieved an RMSE of 0.410 and an R-squared of 0.873. This indicates that it had average error of 0.410 units of q_mean, and the model explains 87.3% of the variability in q_mean. 
+The testing set R-squared is slightly lower than the cross-validation R-squared (0.951), but the RMSE is significantly lower (0.410 vs. 1.58). Sp while the model's power is slightly reduced on unseen data, its prediction accuracy is higher. 
+
+The plot of predicted vs. actual streamflow values shows a pretty strong positive linear relationship, with most points clustered reasonably close to the 1:1 line. 
+Basically the model captures the overall trend in the data, but it is not perfect and could certainly be improved at lower values of log q mean. 
+
+
+ 
